@@ -1165,7 +1165,9 @@ def _session_uses_compute_host(session: dict, cfg: dict | None = None) -> bool:
     # Phase 1 routes lazy/dashboard sessions whose live AIAgent has not been
     # built inside the serving process. Already-built in-process sessions keep
     # the historical path unless a prior isolated turn marked host ownership.
-    return bool(session.get("_compute_host_active")) or (
+    return bool(
+        session.get("_compute_host_active") or session.get("_compute_host_owned")
+    ) or (
         session.get("agent") is None and session.get("agent_ready") is not None
     )
 
@@ -1250,6 +1252,7 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
 def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
     is_error = frame.get("type") == "turn.error"
     with session["history_lock"]:
+        session["_compute_host_owned"] = True
         if frame.get("session_key"):
             session["session_key"] = str(frame.get("session_key"))
         if frame.get("history_version") is not None:
@@ -1295,7 +1298,6 @@ def _submit_prompt_to_compute_host(rid: str, sid: str, session: dict, text: Any)
     except Exception as exc:
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
     with session["history_lock"]:
-        session["_compute_host_active"] = True
         session["attached_images"] = []
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
 
@@ -3592,7 +3594,10 @@ DESKTOP_BACKEND_CONTRACT = 3
 def _session_usage_snapshot(session: dict | None) -> dict:
     agent = (session or {}).get("agent")
     mirror_usage = _metadata_mirror(session).get("usage")
-    if (session or {}).get("_compute_host_active") and isinstance(mirror_usage, dict):
+    if (
+        (session or {}).get("_compute_host_active")
+        or (session or {}).get("_compute_host_owned")
+    ) and isinstance(mirror_usage, dict):
         return dict(mirror_usage)
     if agent is not None:
         return _get_usage(agent)
@@ -3685,7 +3690,10 @@ def _session_info(agent, session: dict | None = None) -> dict:
         info["release_date"] = __release_date__
     except Exception:
         pass
-    if agent is not None and not (session or {}).get("_compute_host_active"):
+    if agent is not None and not (
+        (session or {}).get("_compute_host_active")
+        or (session or {}).get("_compute_host_owned")
+    ):
         try:
             from model_tools import get_toolset_for_tool
 
@@ -3725,7 +3733,10 @@ def _session_info(agent, session: dict | None = None) -> dict:
         info["update_command"] = recommended_update_command()
     except Exception:
         pass
-    if agent is not None and not (session or {}).get("_compute_host_active"):
+    if agent is not None and not (
+        (session or {}).get("_compute_host_active")
+        or (session or {}).get("_compute_host_owned")
+    ):
         warn = _probe_credentials(agent)
         if warn:
             info["credential_warning"] = warn
@@ -5438,6 +5449,10 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
     else queue.
     """
     mode = _load_busy_input_mode()
+    if session.get("_turn_cancel_requested"):
+        # Caller holds history_lock. Once cancellation is published this input
+        # belongs to the replacement generation; never steer the dying turn.
+        mode = "queue"
     agent = session.get("agent")
     if mode == "steer" and agent is not None and hasattr(agent, "steer"):
         try:
@@ -5446,12 +5461,17 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
                 return _ok(rid, {"status": "steered"})
         except Exception:
             pass  # fall through to queue
-    if mode != "queue" and agent is not None and hasattr(agent, "interrupt"):
+    should_interrupt = mode != "queue"
+    if should_interrupt:
+        # Caller holds history_lock. Publish cancellation before signaling so
+        # concurrent session.steer cannot be accepted after interruption begins.
+        session["_turn_cancel_requested"] = True
+    if should_interrupt and agent is not None and hasattr(agent, "interrupt"):
         try:
             agent.interrupt()
         except Exception:
             pass
-    elif mode != "queue" and _session_uses_compute_host(session):
+    elif should_interrupt and _session_uses_compute_host(session):
         try:
             _get_compute_host_supervisor().interrupt(sid)
         except Exception:
@@ -5472,12 +5492,18 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
             return False
+        turn_isolation = _session_uses_compute_host(session)
         session["queued_prompt"] = None
+        # This is a distinct replacement generation. Cancellation belongs only
+        # to the turn that just ended and must not poison steer admission here.
+        session["_turn_cancel_requested"] = False
         session["running"] = True
+        session["_compute_host_active"] = turn_isolation
+        session["_compute_host_owned"] = turn_isolation
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     try:
-        if _session_uses_compute_host(session):
+        if turn_isolation:
             resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"])
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -8505,16 +8531,18 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    assert session is not None
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
-        if session.get("running"):
+        with session["history_lock"]:
+            should_interrupt = bool(session.get("running"))
+            session["_turn_cancel_requested"] = True
+            session["queued_prompt"] = None
+        if should_interrupt:
             try:
                 _get_compute_host_supervisor().interrupt(sid, request_id=f"interrupt-{rid}")
             except Exception as exc:
                 return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
-        with session["history_lock"]:
-            session["_turn_cancel_requested"] = True
-            session["queued_prompt"] = None
         _clear_pending(sid)
         try:
             from tools.approval import resolve_gateway_approval
@@ -8868,6 +8896,7 @@ def _finish_session_turn_locked(session: dict, agent: Any) -> tuple[Any, Excepti
                 if ready is not None:
                     ready.clear()
     session["running"] = False
+    session["_compute_host_active"] = False
     session["last_active"] = time.time()
     _clear_inflight_turn(session)
     return dropped_steer, drain_error
@@ -8964,6 +8993,10 @@ def _(rid, params: dict) -> dict:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
         session["running"] = True
         session["_turn_cancel_requested"] = False
+        # Publish routing ownership with running so session.steer cannot target
+        # a dormant local agent while compute-host submission is in flight.
+        session["_compute_host_active"] = turn_isolation
+        session["_compute_host_owned"] = turn_isolation
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
@@ -8976,6 +9009,10 @@ def _(rid, params: dict) -> dict:
             sid,
             isolated_response["error"].get("message", "unknown error"),
         )
+        with session["history_lock"]:
+            if session.get("running"):
+                session["_compute_host_active"] = False
+                session["_compute_host_owned"] = False
 
     # Persist the DB row lazily, now that the user has actually sent a message.
     _ensure_session_db_row(session)
@@ -9211,6 +9248,23 @@ def _claim_notification_turn(session: dict, evt: dict, owner: str) -> tuple[Any,
     return claim, False
 
 
+def _release_notification_for_retry(process_registry: Any, evt: dict, claim: Any) -> None:
+    """Best-effort release followed by exactly one local retry copy."""
+    from tools.async_delegation import release_event_delivery
+
+    try:
+        release_event_delivery(evt, claim)
+    except Exception as exc:
+        logger.warning("notification delivery claim release failed: %s", exc)
+    finally:
+        process_registry.completion_queue.put(evt)
+
+
+def _requeue_drained_notifications(process_registry: Any, drained: list, start: int) -> None:
+    for pending_evt, _pending_synth in drained[start:]:
+        process_registry.completion_queue.put(pending_evt)
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -9282,7 +9336,13 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
-        _claim, _busy = _claim_notification_turn(session, evt, "tui-poller")
+        try:
+            _claim, _busy = _claim_notification_turn(session, evt, "tui-poller")
+        except Exception as exc:
+            process_registry.completion_queue.put(evt)
+            logger.warning("notification poller claim failed: %s", exc)
+            time.sleep(0.25)
+            continue
         if _busy:
             process_registry.completion_queue.put(evt)
             # Back off before re-polling: the re-queued event keeps the queue
@@ -9294,21 +9354,28 @@ def _notification_poller_loop(
             continue
 
         rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            complete_event_delivery, release_event_delivery,
-        )
+        from tools.async_delegation import complete_event_delivery
         try:
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
         except Exception as exc:
-            release_event_delivery(evt, _claim)
+            _release_notification_for_retry(process_registry, evt, _claim)
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
             _finish_session_turn(session, session.get("agent"))
+            time.sleep(0.25)
+        else:
+            try:
+                complete_event_delivery(evt, _claim)
+            except Exception as exc:
+                logger.error(
+                    "notification delivery acknowledgement failed after dispatch; "
+                    "leaving claim pending: %s",
+                    exc,
+                )
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -9351,7 +9418,12 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
-        _claim, _busy = _claim_notification_turn(session, evt, "tui-poller")
+        try:
+            _claim, _busy = _claim_notification_turn(session, evt, "tui-poller")
+        except Exception as exc:
+            process_registry.completion_queue.put(evt)
+            logger.warning("notification shutdown claim failed: %s", exc)
+            break
         if _busy:
             process_registry.completion_queue.put(evt)
             break
@@ -9359,21 +9431,28 @@ def _notification_poller_loop(
             continue
 
         rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            complete_event_delivery, release_event_delivery,
-        )
+        from tools.async_delegation import complete_event_delivery
         try:
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
         except Exception as exc:
-            release_event_delivery(evt, _claim)
+            _release_notification_for_retry(process_registry, evt, _claim)
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
             _finish_session_turn(session, session.get("agent"))
+            break
+        else:
+            try:
+                complete_event_delivery(evt, _claim)
+            except Exception as exc:
+                logger.error(
+                    "notification delivery acknowledgement failed after dispatch; "
+                    "leaving claim pending: %s",
+                    exc,
+                )
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -9931,30 +10010,42 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 skip_poll_observed=False,
             )
             for index, (_evt, synth) in enumerate(drained):
-                _claim, _busy = _claim_notification_turn(
-                    session, _evt, "tui-post-turn"
-                )
+                try:
+                    _claim, _busy = _claim_notification_turn(
+                        session, _evt, "tui-post-turn"
+                    )
+                except Exception as _claim_exc:
+                    _requeue_drained_notifications(process_registry, drained, index)
+                    logger.warning("post-turn notification claim failed: %s", _claim_exc)
+                    break
                 if _busy:
-                    for pending_evt, _pending_synth in drained[index:]:
-                        process_registry.completion_queue.put(pending_evt)
+                    _requeue_drained_notifications(process_registry, drained, index)
                     break
                 if _claim is None:
                     continue
-                from tools.async_delegation import (
-                    complete_event_delivery, release_event_delivery,
-                )
+                from tools.async_delegation import complete_event_delivery
                 try:
                     _emit("message.start", sid)
                     _run_prompt_submit(rid, sid, session, synth)
-                    complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
-                    release_event_delivery(_evt, _claim)
+                    _release_notification_for_retry(process_registry, _evt, _claim)
+                    _requeue_drained_notifications(process_registry, drained, index + 1)
                     print(
                         f"[tui_gateway] completion notification dispatch failed: "
                         f"{type(_n_exc).__name__}: {_n_exc}",
                         file=sys.stderr,
                     )
                     _finish_session_turn(session, session.get("agent"))
+                    break
+                else:
+                    try:
+                        complete_event_delivery(_evt, _claim)
+                    except Exception as _ack_exc:
+                        logger.error(
+                            "post-turn notification acknowledgement failed after "
+                            "dispatch; leaving claim pending: %s",
+                            _ack_exc,
+                        )
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "

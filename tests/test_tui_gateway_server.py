@@ -242,6 +242,108 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
         server._sessions.pop("iso-sid", None)
 
 
+def test_compute_host_ownership_is_published_before_submit_returns(monkeypatch):
+    submit_started = threading.Event()
+    allow_submit = threading.Event()
+
+    class _Supervisor:
+        def submit_turn(self, _frame, *, on_complete=None):  # noqa: ARG002
+            submit_started.set()
+            assert allow_submit.wait(timeout=1)
+
+    class _Agent:
+        def __init__(self):
+            self.steers = []
+
+        def steer(self, text):
+            self.steers.append(text)
+            return True
+
+    session = _session(agent_ready=threading.Event())
+    session["agent"] = None
+    server._sessions["iso-race"] = session
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+    monkeypatch.setattr(server, "_turn_isolation_enabled", lambda _cfg=None: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+    response = {}
+
+    def submit():
+        response["value"] = server.handle_request(
+            {
+                "id": "submit-race",
+                "method": "prompt.submit",
+                "params": {"session_id": "iso-race", "text": "hello"},
+            }
+        )
+
+    thread = threading.Thread(target=submit)
+    thread.start()
+    try:
+        assert submit_started.wait(timeout=1)
+        assert session["running"] is True
+        assert session["_compute_host_active"] is True
+        local_agent = _Agent()
+        session["agent"] = local_agent
+
+        steer = server.handle_request(
+            {
+                "id": "misroute-check",
+                "method": "session.steer",
+                "params": {"session_id": "iso-race", "text": "wrong host"},
+            }
+        )
+        assert steer is not None
+        assert steer["error"]["code"] == 4009
+        assert local_agent.steers == []
+
+        allow_submit.set()
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+    finally:
+        allow_submit.set()
+        thread.join(timeout=1)
+        server._sessions.pop("iso-race", None)
+
+    assert response["value"]["result"] == {"status": "streaming", "turn_isolation": True}
+
+
+def test_fast_compute_host_completion_cannot_reactivate_parent_session(monkeypatch):
+    class _Supervisor:
+        def submit_turn(self, frame, *, on_complete=None):
+            assert on_complete is not None
+            on_complete(
+                {
+                    "type": "turn.end",
+                    "sid": frame["sid"],
+                    "request_id": frame["request_id"],
+                    "history_version": 1,
+                }
+            )
+
+    session = _session(agent_ready=threading.Event())
+    session["agent"] = None
+    server._sessions["iso-fast"] = session
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+    monkeypatch.setattr(server, "_turn_isolation_enabled", lambda _cfg=None: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    try:
+        response = server.handle_request(
+            {
+                "id": "fast",
+                "method": "prompt.submit",
+                "params": {"session_id": "iso-fast", "text": "hello"},
+            }
+        )
+    finally:
+        server._sessions.pop("iso-fast", None)
+
+    assert response is not None
+    assert response["result"] == {"status": "streaming", "turn_isolation": True}
+    assert session["running"] is False
+    assert session["_compute_host_active"] is False
+
+
 def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monkeypatch):
     class _BrokenSupervisor:
         def submit_turn(self, frame, *, on_complete=None):
@@ -6843,6 +6945,195 @@ def test_interrupt_closes_steer_admission_before_signaling_agent():
     assert steer_calls == []
 
 
+def test_isolated_interrupt_preserves_prompt_queued_while_signal_is_in_flight(monkeypatch):
+    interrupt_started = threading.Event()
+    allow_interrupt = threading.Event()
+
+    class _Supervisor:
+        def interrupt(self, _sid, request_id=None):  # noqa: ARG002
+            interrupt_started.set()
+            assert allow_interrupt.wait(timeout=1)
+
+    session = _session(
+        agent=None,
+        running=True,
+        queued_prompt={"text": "stale queued prompt", "transport": None},
+        _compute_host_active=True,
+    )
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: _Supervisor())
+    monkeypatch.setattr(server, "_turn_isolation_enabled", lambda _cfg=None: True)
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    interrupt_response = {}
+
+    def interrupt_turn():
+        interrupt_response["value"] = server.handle_request(
+            {
+                "id": "interrupt",
+                "method": "session.interrupt",
+                "params": {"session_id": "sid"},
+            }
+        )
+
+    thread = threading.Thread(target=interrupt_turn)
+    thread.start()
+    try:
+        assert interrupt_started.wait(timeout=1)
+        assert session["queued_prompt"] is None
+
+        queued = server.handle_request(
+            {
+                "id": "queued-during-interrupt",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "must survive"},
+            }
+        )
+        assert queued is not None
+        assert queued["result"]["status"] == "queued"
+
+        allow_interrupt.set()
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+    finally:
+        allow_interrupt.set()
+        thread.join(timeout=1)
+        server._sessions.pop("sid", None)
+
+    result = interrupt_response["value"]
+    assert result is not None
+    assert result["result"]["status"] == "interrupted"
+    assert session["queued_prompt"]["text"] == "must survive"
+
+
+def test_busy_submit_publishes_cancellation_before_interrupt_signal(monkeypatch):
+    interrupt_started = threading.Event()
+    allow_interrupt = threading.Event()
+
+    class _Agent:
+        def interrupt(self):
+            interrupt_started.set()
+            assert allow_interrupt.wait(timeout=1)
+
+        def steer(self, _text):
+            return True
+
+    session = _session(agent=_Agent(), running=True)
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    submit_response = {}
+    steer_response = {}
+
+    def submit_busy_prompt():
+        submit_response["value"] = server.handle_request(
+            {
+                "id": "busy",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "next turn"},
+            }
+        )
+
+    def steer_during_interrupt():
+        steer_response["value"] = server.handle_request(
+            {
+                "id": "steer",
+                "method": "session.steer",
+                "params": {"session_id": "sid", "text": "too late"},
+            }
+        )
+
+    submit_thread = threading.Thread(target=submit_busy_prompt)
+    submit_thread.start()
+    try:
+        assert interrupt_started.wait(timeout=1)
+        steer_thread = threading.Thread(target=steer_during_interrupt)
+        steer_thread.start()
+        allow_interrupt.set()
+        submit_thread.join(timeout=1)
+        steer_thread.join(timeout=1)
+        assert not submit_thread.is_alive()
+        assert not steer_thread.is_alive()
+    finally:
+        allow_interrupt.set()
+        submit_thread.join(timeout=1)
+        server._sessions.pop("sid", None)
+
+    assert submit_response["value"]["result"]["status"] == "queued"
+    assert steer_response["value"]["error"]["code"] == 4009
+    assert session["_turn_cancel_requested"] is True
+
+
+def test_queued_replacement_turn_clears_prior_cancellation(monkeypatch):
+    steer_calls = []
+
+    class _Agent:
+        def steer(self, text):
+            steer_calls.append(text)
+            return True
+
+    session = _session(
+        agent=_Agent(),
+        running=False,
+        _turn_cancel_requested=True,
+        queued_prompt={"text": "replacement", "transport": None},
+    )
+    server._sessions["sid"] = session
+    observed = {}
+
+    def dispatch(_rid, _sid, current, text):
+        observed["cancel"] = current["_turn_cancel_requested"]
+        observed["text"] = text
+        observed["steer"] = server.handle_request(
+            {
+                "id": "steer-replacement",
+                "method": "session.steer",
+                "params": {"session_id": "sid", "text": "valid"},
+            }
+        )
+
+    monkeypatch.setattr(server, "_run_prompt_submit", dispatch)
+    try:
+        assert server._drain_queued_prompt("queued", "sid", session) is True
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert observed["cancel"] is False
+    assert observed["text"] == "replacement"
+    assert observed["steer"]["result"]["status"] == "queued"
+    assert steer_calls == ["valid"]
+
+
+def test_cancelled_busy_steer_mode_queues_for_replacement(monkeypatch):
+    steer_calls = []
+
+    class _Agent:
+        def steer(self, text):
+            steer_calls.append(text)
+            return True
+
+    session = _session(
+        agent=_Agent(),
+        running=True,
+        _turn_cancel_requested=True,
+    )
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
+    try:
+        response = server.handle_request(
+            {
+                "id": "after-cancel",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "replacement guidance"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response is not None
+    assert response["result"]["status"] == "queued"
+    assert steer_calls == []
+    assert session["queued_prompt"]["text"] == "replacement guidance"
+
+
 def test_run_prompt_submit_registers_turn_thread_for_interrupt(monkeypatch):
     """_run_prompt_submit must expose the actual turn thread to session.interrupt.
 
@@ -9621,6 +9912,147 @@ def test_notification_claim_precedes_running_publication(monkeypatch):
     assert claim is token
     assert busy is False
     assert session["running"] is True
+
+
+def test_notification_retry_requeues_even_when_release_raises(monkeypatch):
+    import queue
+
+    from tools import async_delegation
+
+    registry = types.SimpleNamespace(completion_queue=queue.Queue())
+    event = {"type": "completion"}
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("release failed")),
+    )
+
+    server._release_notification_for_retry(registry, event, object())
+
+    assert registry.completion_queue.qsize() == 1
+    assert registry.completion_queue.get_nowait() is event
+
+
+@pytest.mark.parametrize("failure", ["claim", "dispatch", "acknowledgement"])
+def test_notification_live_failure_requeues_exactly_once(monkeypatch, failure):
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "completion",
+        "session_id": f"live-{failure}",
+        "command": "echo live",
+        "exit_code": 0,
+        "output": "live",
+    }
+    stop = threading.Event()
+
+    class _OneLiveQueue:
+        def __init__(self):
+            self.requeued = []
+
+        def get(self, timeout=None):  # noqa: ARG002
+            stop.set()
+            return event
+
+        def put(self, item):
+            self.requeued.append(item)
+
+        def empty(self):
+            return True
+
+    isolated_queue = _OneLiveQueue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(process_registry, "is_completion_consumed", lambda _sid: False)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server.time, "sleep", lambda _seconds: None)
+    if failure == "claim":
+        monkeypatch.setattr(
+            async_delegation,
+            "claim_event_delivery",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("claim failed")),
+        )
+    elif failure == "dispatch":
+        monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: object())
+        monkeypatch.setattr(async_delegation, "release_event_delivery", lambda *_args: None)
+        monkeypatch.setattr(
+            server,
+            "_run_prompt_submit",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("dispatch failed")),
+        )
+    else:
+        monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: object())
+        monkeypatch.setattr(
+            async_delegation,
+            "complete_event_delivery",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("acknowledgement failed")),
+        )
+        monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args: None)
+    session = _session(running=False)
+
+    server._notification_poller_loop(stop, "sid", session)
+
+    if failure == "acknowledgement":
+        assert isolated_queue.requeued == []
+        assert session["running"] is True
+    else:
+        assert isolated_queue.requeued == [event]
+        assert session["running"] is False
+
+
+@pytest.mark.parametrize("failure", ["claim", "dispatch"])
+def test_notification_shutdown_failure_requeues_exactly_once(monkeypatch, failure):
+    import queue
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "completion",
+        "session_id": f"shutdown-{failure}",
+        "command": "echo shutdown",
+        "exit_code": 0,
+        "output": "shutdown",
+    }
+    isolated_queue = queue.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(process_registry, "is_completion_consumed", lambda _sid: False)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    if failure == "claim":
+        monkeypatch.setattr(
+            async_delegation,
+            "claim_event_delivery",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("claim failed")),
+        )
+    else:
+        monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: object())
+        monkeypatch.setattr(async_delegation, "release_event_delivery", lambda *_args: None)
+        monkeypatch.setattr(
+            server,
+            "_run_prompt_submit",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("dispatch failed")),
+        )
+    session = _session(running=False)
+    stop = threading.Event()
+    stop.set()
+
+    server._notification_poller_loop(stop, "sid", session)
+
+    assert isolated_queue.qsize() == 1
+    assert isolated_queue.get_nowait() is event
+    assert session["running"] is False
+
+
+def test_requeue_drained_notifications_preserves_current_and_remainder():
+    import queue
+
+    registry = types.SimpleNamespace(completion_queue=queue.Queue())
+    events = [({"id": 1}, "one"), ({"id": 2}, "two"), ({"id": 3}, "three")]
+
+    server._requeue_drained_notifications(registry, events, 1)
+
+    assert [registry.completion_queue.get_nowait()["id"] for _ in range(2)] == [2, 3]
 
 
 def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
