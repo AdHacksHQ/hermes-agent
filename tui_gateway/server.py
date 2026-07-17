@@ -15,7 +15,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 from hermes_constants import (
     get_hermes_home,
@@ -5433,6 +5433,61 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     session["queued_prompt"] = {"text": text, "transport": transport}
 
 
+def _start_inline_successor_turn_locked(session: dict) -> bool:
+    """Publish a fresh internal turn while the caller holds history_lock."""
+    if session.get("running") or session.get("_interrupt_signal_inflight"):
+        return False
+    session["running"] = True
+    session["_turn_cancel_requested"] = False
+    session["_compute_host_active"] = False
+    return True
+
+
+def _signal_interrupt_locked(
+    rid: Any,
+    sid: str,
+    session: dict,
+    signal: Callable[[], None],
+) -> tuple[Exception | None, bool]:
+    """Signal a predecessor without exposing any successor to its side effects.
+
+    The caller holds history_lock. The gate remains published through both the
+    callback-capable signal and any claimed successor's external dispatch.
+    """
+    history_lock = session["history_lock"]
+    session["_interrupt_signal_inflight"] = True
+    signal_error: Exception | None = None
+    successor_started = False
+    history_lock.release()
+    try:
+        signal()
+    except Exception as exc:
+        signal_error = exc
+    finally:
+        history_lock.acquire()
+
+    try:
+        while True:
+            claimed = _claim_queued_prompt_locked(session, allow_signal_inflight=True)
+            if claimed is None:
+                break
+            successor_started = True
+            history_lock.release()
+            try:
+                dispatched = _dispatch_claimed_prompt(rid, sid, session, claimed)
+            finally:
+                history_lock.acquire()
+            if not dispatched:
+                break
+            # A normally-running successor owns the next drain. Loop only when
+            # dispatch completed synchronously and left another prompt queued.
+            if session.get("running"):
+                break
+    finally:
+        session["_interrupt_signal_inflight"] = False
+    return signal_error, successor_started
+
+
 def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any) -> dict:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -5454,70 +5509,141 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
         # belongs to the replacement generation; never steer the dying turn.
         mode = "queue"
     agent = session.get("agent")
-    if mode == "steer" and agent is not None and hasattr(agent, "steer"):
-        try:
-            if agent.steer(text):
-                session["last_active"] = time.time()
-                return _ok(rid, {"status": "steered"})
-        except Exception:
-            pass  # fall through to queue
+    if mode == "steer":
+        admitted = _admit_session_steer_locked(rid, session, str(text))
+        if not admitted.get("error"):
+            session["last_active"] = time.time()
+            return _ok(rid, {"status": "steered"})
     should_interrupt = mode != "queue"
     if should_interrupt:
         # Caller holds history_lock. Publish cancellation before signaling so
         # concurrent session.steer cannot be accepted after interruption begins.
         session["_turn_cancel_requested"] = True
-    if should_interrupt and agent is not None and hasattr(agent, "interrupt"):
-        try:
-            agent.interrupt()
-        except Exception:
-            pass
-    elif should_interrupt and _session_uses_compute_host(session):
-        try:
-            _get_compute_host_supervisor().interrupt(sid)
-        except Exception:
-            pass
     _enqueue_prompt(session, text, transport)
     session["last_active"] = time.time()
+    if should_interrupt:
+        has_agent_interrupt = agent is not None and hasattr(agent, "interrupt")
+        use_compute_host = not has_agent_interrupt and _session_uses_compute_host(session)
+        def _signal() -> None:
+            if has_agent_interrupt and agent is not None:
+                agent.interrupt()
+            elif use_compute_host:
+                _get_compute_host_supervisor().interrupt(sid)
+
+        _signal_interrupt_locked(rid, sid, session, _signal)
     return _ok(rid, {"status": "queued"})
 
 
-def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
-    """Fire a queued next-turn prompt if one is waiting and the session is idle.
+def _claim_queued_prompt_locked(
+    session: dict,
+    *,
+    allow_signal_inflight: bool = False,
+) -> tuple[dict, bool] | None:
+    queued = session.get("queued_prompt")
+    if (
+        not queued
+        or session.get("running")
+        or (session.get("_interrupt_signal_inflight") and not allow_signal_inflight)
+    ):
+        return None
+    turn_isolation = _session_uses_compute_host(session)
+    session["queued_prompt"] = None
+    session["_turn_cancel_requested"] = False
+    session["running"] = True
+    session["_compute_host_active"] = turn_isolation
+    session["_compute_host_owned"] = turn_isolation
+    if queued.get("transport") is not None:
+        session["transport"] = queued["transport"]
+    return queued, turn_isolation
 
-    Returns True if a queued prompt was dispatched (the caller should then skip
-    lower-priority follow-ups this cycle — the user's message wins). Mirrors the
-    claim-under-lock pattern used by the goal-continuation re-fire.
-    """
-    with session["history_lock"]:
-        queued = session.get("queued_prompt")
-        if not queued or session.get("running"):
-            return False
-        turn_isolation = _session_uses_compute_host(session)
-        session["queued_prompt"] = None
-        # This is a distinct replacement generation. Cancellation belongs only
-        # to the turn that just ended and must not poison steer admission here.
-        session["_turn_cancel_requested"] = False
-        session["running"] = True
-        session["_compute_host_active"] = turn_isolation
-        session["_compute_host_owned"] = turn_isolation
-        if queued.get("transport") is not None:
-            session["transport"] = queued["transport"]
-    try:
-        if turn_isolation:
+
+def _dispatch_claimed_prompt(
+    rid: Any,
+    sid: str,
+    session: dict,
+    claimed: tuple[dict, bool],
+) -> bool:
+    queued, turn_isolation = claimed
+    if turn_isolation:
+        try:
             resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"])
-            if resp.get("error"):
-                message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
-                _finish_session_turn(session, session.get("agent"))
+        except Exception as exc:
+            _finish_and_restore_claimed_prompt(session, queued)
+            _report_queued_dispatch_failure(exc)
+            return False
+        if resp.get("error"):
+            message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
+            _finish_and_restore_claimed_prompt(session, queued)
+            try:
                 _emit("error", sid, {"message": message})
-        else:
+            except Exception as exc:
+                _report_queued_dispatch_failure(exc)
+            return False
+    else:
+        try:
             _run_prompt_submit(rid, sid, session, queued["text"])
-    except Exception as exc:
+        except Exception as exc:
+            _finish_and_restore_claimed_prompt(session, queued)
+            _report_queued_dispatch_failure(exc)
+            return False
+    return True
+
+
+def _report_queued_dispatch_failure(exc: Exception) -> None:
+    try:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
             f"{type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
-        _finish_session_turn(session, session.get("agent"))
+    except Exception:
+        pass
+
+
+def _restore_claimed_prompt_locked(session: dict, failed: dict) -> None:
+    """Restore a failed claim ahead of newer input while history_lock is held."""
+    newer = session.get("queued_prompt")
+    if not newer:
+        session["queued_prompt"] = dict(failed)
+        return
+    failed_text = failed.get("text")
+    newer_text = newer.get("text")
+    if isinstance(failed_text, str) and isinstance(newer_text, str):
+        text = (
+            f"{failed_text}\n\n{newer_text}"
+            if failed_text and newer_text
+            else (failed_text or newer_text)
+        )
+    else:
+        # Gateway prompt submissions are string-shaped. Preserve the older
+        # acknowledged payload rather than allowing newer work to pass it.
+        text = failed_text
+    session["queued_prompt"] = {
+        "text": text,
+        "transport": newer.get("transport") or failed.get("transport"),
+    }
+
+
+def _finish_and_restore_claimed_prompt(session: dict, failed: dict) -> None:
+    """Publish failed-turn finalization and queue restoration atomically."""
+    with session["history_lock"]:
+        dropped_steer, drain_error = _finish_session_turn_locked(
+            session, session.get("agent")
+        )
+        _restore_claimed_prompt_locked(session, failed)
+    try:
+        _log_finished_session_steer(dropped_steer, drain_error)
+    except Exception as exc:
+        _report_queued_dispatch_failure(exc)
+
+
+def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+    """Claim and dispatch the oldest queued successor when the session is idle."""
+    with session["history_lock"]:
+        claimed = _claim_queued_prompt_locked(session)
+    if claimed is None:
+        return False
+    _dispatch_claimed_prompt(rid, sid, session, claimed)
     return True
 
 
@@ -8534,15 +8660,22 @@ def _(rid, params: dict) -> dict:
     assert session is not None
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
+        signal_error = None
         with session["history_lock"]:
             should_interrupt = bool(session.get("running"))
             session["_turn_cancel_requested"] = True
             session["queued_prompt"] = None
-        if should_interrupt:
-            try:
-                _get_compute_host_supervisor().interrupt(sid, request_id=f"interrupt-{rid}")
-            except Exception as exc:
-                return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
+            if should_interrupt:
+                signal_error, _ = _signal_interrupt_locked(
+                    rid,
+                    sid,
+                    session,
+                    lambda: _get_compute_host_supervisor().interrupt(
+                        sid, request_id=f"interrupt-{rid}"
+                    ),
+                )
+        if signal_error is not None:
+            return _err(rid, 5019, f"compute-host interrupt failed: {signal_error}")
         _clear_pending(sid)
         try:
             from tools.approval import resolve_gateway_approval
@@ -8562,6 +8695,9 @@ def _(rid, params: dict) -> dict:
     # Always tell the agent to interrupt when the session claims a run is active:
     # stale flags are cleared below, and fresh turns clear the interrupt flag at
     # entry. This keeps a stale/missing thread handle from making Stop a no-op.
+    dropped_steer = None
+    drain_error = None
+    signal_error = None
     with session["history_lock"]:
         run_thread = session.get("_run_thread")
         run_thread_alive = run_thread is not None and run_thread.is_alive()
@@ -8569,17 +8705,18 @@ def _(rid, params: dict) -> dict:
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
         agent = session.get("agent")
-    if should_interrupt and agent is not None and hasattr(agent, "interrupt"):
-        agent.interrupt()
-    if not run_thread_alive:
-        dropped_steer = None
-        drain_error = None
-        with session["history_lock"]:
-            if session.get("running"):
-                dropped_steer, drain_error = _finish_session_turn_locked(
-                    session, session.get("agent")
-                )
-        _log_finished_session_steer(dropped_steer, drain_error)
+        successor_started = False
+        if should_interrupt and agent is not None and hasattr(agent, "interrupt"):
+            signal_error, successor_started = _signal_interrupt_locked(
+                rid, str(params.get("session_id") or ""), session, agent.interrupt
+            )
+        if not run_thread_alive and not successor_started and session.get("running"):
+            dropped_steer, drain_error = _finish_session_turn_locked(
+                session, session.get("agent")
+            )
+    _log_finished_session_steer(dropped_steer, drain_error)
+    if signal_error is not None:
+        return _err(rid, 5000, f"interrupt failed: {signal_error}")
 
     # Stop = stop the TURN (cooperative interrupt above also kills the in-flight
     # foreground subprocess). Background processes the agent started (dev servers,
@@ -8824,15 +8961,29 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, payload)
 
 
+def _admit_session_steer_locked(rid: Any, session: dict, text: str) -> dict:
+    """Apply the single steer admission policy while history_lock is held."""
+    if not session.get("running"):
+        return _err(rid, 4009, "session is not running")
+    if session.get("_turn_cancel_requested"):
+        return _err(rid, 4009, "session turn is stopping")
+    if session.get("_compute_host_active"):
+        return _err(rid, 4009, "steer is unavailable for an isolated turn")
+    agent = session.get("agent")
+    if agent is None or not hasattr(agent, "steer"):
+        return _err(rid, 4010, "agent does not support steer")
+    try:
+        accepted = agent.steer(text)
+    except Exception as exc:
+        return _err(rid, 5000, f"steer failed: {exc}")
+    if not accepted:
+        return _err(rid, 4009, "session is not accepting steer")
+    return _ok(rid, {"status": "queued", "text": text})
+
+
 @method("session.steer")
 def _(rid, params: dict) -> dict:
-    """Inject a user message into the next tool result without interrupting.
-
-    Mirrors AIAgent.steer(). Safe to call while a turn is running — the text
-    lands on the last tool result of the next tool batch and the model sees
-    it on its next iteration. No interrupt, no new user turn, no role
-    alternation violation.
-    """
+    """Inject a user message into the next tool result without interrupting."""
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")
@@ -8840,27 +8991,9 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     assert session is not None
-    # Serialize against prompt completion. `running` is set/cleared under this
-    # same per-session lock, so a steer either lands in the active turn before
-    # completion wins the lock or is rejected after completion clears it. An
-    # idle steer must never remain queued for an unrelated future turn.
+    # Serialize against prompt completion and every other steer surface.
     with session["history_lock"]:
-        if not session.get("running"):
-            return _err(rid, 4009, "session is not running")
-        if session.get("_turn_cancel_requested"):
-            return _err(rid, 4009, "session turn is stopping")
-        if session.get("_compute_host_active"):
-            return _err(rid, 4009, "steer is unavailable for an isolated turn")
-        agent = session.get("agent")
-        if agent is None or not hasattr(agent, "steer"):
-            return _err(rid, 4010, "agent does not support steer")
-        try:
-            accepted = agent.steer(text)
-        except Exception as exc:
-            return _err(rid, 5000, f"steer failed: {exc}")
-        if not accepted:
-            return _err(rid, 4009, "session is not accepting steer")
-    return _ok(rid, {"status": "queued", "text": text})
+        return _admit_session_steer_locked(rid, session, text)
 
 
 def _finish_session_turn_locked(session: dict, agent: Any) -> tuple[Any, Exception | None]:
@@ -8956,6 +9089,25 @@ def _(rid, params: dict) -> dict:
     if (t := current_transport()) is not None:
         session["transport"] = t
     with session["history_lock"]:
+        if session.get("_interrupt_signal_inflight"):
+            _enqueue_prompt(session, text, t or session.get("transport"))
+            session["last_active"] = time.time()
+            return _ok(rid, {"status": "queued"})
+        if session.get("queued_prompt") and not session.get("running"):
+            # A prior acknowledged successor survived a synchronous dispatch
+            # failure. Merge this newer input behind it and claim the combined
+            # queue before allowing a fresh turn to overtake either message.
+            _enqueue_prompt(session, text, t or session.get("transport"))
+            claimed = _claim_queued_prompt_locked(session)
+            history_lock = session["history_lock"]
+            history_lock.release()
+            try:
+                dispatched = bool(
+                    claimed and _dispatch_claimed_prompt(rid, sid, session, claimed)
+                )
+            finally:
+                history_lock.acquire()
+            return _ok(rid, {"status": "streaming" if dispatched else "queued"})
         if session.get("running"):
             # Don't reject a mid-turn prompt — queue it (and, by default,
             # interrupt the live turn) so it runs as the next turn. See
@@ -9237,11 +9389,7 @@ def _claim_notification_turn(session: dict, evt: dict, owner: str) -> tuple[Any,
     if claim is None:
         return None, False
     with session["history_lock"]:
-        if session.get("running"):
-            busy = True
-        else:
-            session["running"] = True
-            busy = False
+        busy = not _start_inline_successor_turn_locked(session)
     if busy:
         release_event_delivery(evt, claim)
         return None, True
@@ -9972,11 +10120,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # we check that guard before re-firing.
         if goal_followup:
             with session["history_lock"]:
-                if session.get("running"):
+                if not _start_inline_successor_turn_locked(session):
                     # User already sent something — their turn wins,
                     # the judge will re-run on the next turn anyway.
                     return
-                session["running"] = True
             try:
                 _emit("message.start", sid)
                 _run_prompt_submit(rid, sid, session, goal_followup)
@@ -12806,22 +12953,19 @@ def _(rid, params: dict) -> dict:
     if name == "steer":
         if not arg:
             return _err(rid, 4004, "usage: /steer <prompt>")
-        agent = session.get("agent") if session else None
-        if agent and hasattr(agent, "steer"):
-            try:
-                accepted = agent.steer(arg)
-                if accepted:
-                    return _ok(
-                        rid,
-                        {
-                            "type": "exec",
-                            "output": f"⏩ Steer queued — arrives after the next tool call: {arg[:80]}{'...' if len(arg) > 80 else ''}",
-                        },
-                    )
-            except Exception:
-                pass
-        # Fallback: no active run, treat as next-turn message
-        return _ok(rid, {"type": "send", "message": arg})
+        if not session:
+            return _err(rid, 4001, "no active session")
+        with session["history_lock"]:
+            admitted = _admit_session_steer_locked(rid, session, arg)
+        if admitted.get("error"):
+            return admitted
+        return _ok(
+            rid,
+            {
+                "type": "exec",
+                "output": f"⏩ Steer queued — arrives after the next tool call: {arg[:80]}{'...' if len(arg) > 80 else ''}",
+            },
+        )
 
     if name == "goal":
         if not session:

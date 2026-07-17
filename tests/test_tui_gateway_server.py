@@ -6163,6 +6163,64 @@ def test_session_steer_rejects_idle_session_without_stashing_for_a_future_turn()
     assert "steer_text" not in calls
 
 
+@pytest.mark.parametrize(
+    ("state", "message"),
+    [
+        ({"_turn_cancel_requested": True}, "session turn is stopping"),
+        ({"_compute_host_active": True}, "steer is unavailable for an isolated turn"),
+    ],
+)
+def test_slash_steer_uses_guarded_admission(state, message):
+    calls = []
+
+    class _Agent:
+        def steer(self, text):
+            calls.append(text)
+            return True
+
+    server._sessions["sid"] = _session(agent=_Agent(), running=True, **state)
+    try:
+        response = server.handle_request(
+            {
+                "id": "slash-steer",
+                "method": "command.dispatch",
+                "params": {"session_id": "sid", "name": "steer", "arg": "late guidance"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response is not None
+    assert response["error"]["code"] == 4009
+    assert response["error"]["message"] == message
+    assert calls == []
+
+
+def test_slash_steer_accepts_only_through_shared_admission():
+    calls = []
+
+    class _Agent:
+        def steer(self, text):
+            calls.append(text)
+            return True
+
+    server._sessions["sid"] = _session(agent=_Agent(), running=True)
+    try:
+        response = server.handle_request(
+            {
+                "id": "slash-steer",
+                "method": "command.dispatch",
+                "params": {"session_id": "sid", "name": "steer", "arg": "valid guidance"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response is not None
+    assert response["result"]["type"] == "exec"
+    assert calls == ["valid guidance"]
+
+
 def test_session_steer_rejects_isolated_turn_instead_of_steering_dormant_agent():
     calls = {}
 
@@ -7062,6 +7120,202 @@ def test_busy_submit_publishes_cancellation_before_interrupt_signal(monkeypatch)
     assert session["_turn_cancel_requested"] is True
 
 
+def test_busy_submit_interrupt_signal_allows_reentrant_gateway_call(monkeypatch):
+    nested = {}
+
+    class _Agent:
+        def steer(self, _text):
+            raise AssertionError("cancelled turn must reject before agent.steer")
+
+        def interrupt(self):
+            nested["response"] = server.handle_request(
+                {
+                    "id": "nested",
+                    "method": "session.steer",
+                    "params": {"session_id": "sid", "text": "too late"},
+                }
+            )
+
+    session = _session(agent=_Agent(), running=True)
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    try:
+        response = server.handle_request(
+            {
+                "id": "busy",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "replacement"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response is not None
+    assert response["result"]["status"] == "queued"
+    assert nested["response"]["error"]["code"] == 4009
+    assert session["queued_prompt"]["text"] == "replacement"
+
+
+def test_successor_waits_until_predecessor_interrupt_signal_finishes(monkeypatch):
+    events = []
+    holder = {}
+
+    class _Agent:
+        def interrupt(self):
+            current = holder["session"]
+            events.append("signal-start")
+            server._finish_session_turn(current, self)
+            during = server.handle_request(
+                {
+                    "id": "during-signal",
+                    "method": "prompt.submit",
+                    "params": {"session_id": "sid", "text": "during signal"},
+                }
+            )
+            assert during is not None
+            events.append(("submit-during-signal", during["result"]["status"]))
+            events.append(
+                ("drain-during-signal", server._drain_queued_prompt("old", "sid", current))
+            )
+            events.append("signal-end")
+
+    session = _session(agent=_Agent(), running=True)
+    holder["session"] = session
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+
+    def _dispatch_successor(_rid, _sid, _session, text):
+        events.append(("successor", text))
+        during = server.handle_request(
+            {
+                "id": "during-dispatch",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "after replacement"},
+            }
+        )
+        assert during is not None
+        events.append(("submit-during-dispatch", during["result"]["status"]))
+
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        _dispatch_successor,
+    )
+    try:
+        response = server.handle_request(
+            {
+                "id": "busy",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "replacement"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response is not None
+    assert response["result"]["status"] == "queued"
+    assert events == [
+        "signal-start",
+        ("submit-during-signal", "queued"),
+        ("drain-during-signal", False),
+        "signal-end",
+        ("successor", "replacement\n\nduring signal"),
+        ("submit-during-dispatch", "queued"),
+    ]
+    assert session["queued_prompt"]["text"] == "after replacement"
+
+
+def test_explicit_local_interrupt_gates_reentrant_successor(monkeypatch):
+    events = []
+    holder = {}
+
+    class _Agent:
+        def interrupt(self):
+            current = holder["session"]
+            events.append("signal-start")
+            server._finish_session_turn(current, self)
+            nested = server.handle_request(
+                {
+                    "id": "nested",
+                    "method": "prompt.submit",
+                    "params": {"session_id": "sid", "text": "successor"},
+                }
+            )
+            assert nested is not None
+            events.append(("nested", nested["result"]["status"]))
+            events.append("signal-end")
+
+    session = _session(agent=_Agent(), running=True)
+    holder["session"] = session
+    server._sessions["sid"] = session
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, _session, text: events.append(("successor", text)),
+    )
+    try:
+        response = server.handle_request(
+            {"id": "stop", "method": "session.interrupt", "params": {"session_id": "sid"}}
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response is not None
+    assert response["result"]["status"] == "interrupted"
+    assert events == [
+        "signal-start",
+        ("nested", "queued"),
+        "signal-end",
+        ("successor", "successor"),
+    ]
+
+
+def test_explicit_compute_interrupt_gates_reentrant_successor(monkeypatch):
+    events = []
+    session = _session(agent_ready=threading.Event(), running=True)
+    session["agent"] = None
+    session["_compute_host_active"] = True
+    server._sessions["sid"] = session
+
+    class _Supervisor:
+        def interrupt(self, _sid, request_id=None):  # noqa: ARG002
+            events.append("signal-start")
+            server._finish_session_turn(session, None)
+            nested = server.handle_request(
+                {
+                    "id": "nested",
+                    "method": "prompt.submit",
+                    "params": {"session_id": "sid", "text": "successor"},
+                }
+            )
+            assert nested is not None
+            events.append(("nested", nested["result"]["status"]))
+            events.append("signal-end")
+
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: _Supervisor())
+    monkeypatch.setattr(
+        server,
+        "_submit_prompt_to_compute_host",
+        lambda _rid, _sid, _session, text: events.append(("successor", text)) or {"result": {}},
+    )
+    try:
+        response = server.handle_request(
+            {"id": "stop", "method": "session.interrupt", "params": {"session_id": "sid"}}
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response is not None
+    assert response["result"]["status"] == "interrupted"
+    assert events == [
+        "signal-start",
+        ("nested", "queued"),
+        "signal-end",
+        ("successor", "successor"),
+    ]
+
+
 def test_queued_replacement_turn_clears_prior_cancellation(monkeypatch):
     steer_calls = []
 
@@ -7102,6 +7356,186 @@ def test_queued_replacement_turn_clears_prior_cancellation(monkeypatch):
     assert steer_calls == ["valid"]
 
 
+def test_failed_queued_dispatch_restores_claim_ahead_of_newer_input(monkeypatch):
+    session = _session(
+        running=False,
+        queued_prompt={"text": "older", "transport": "older-transport"},
+    )
+
+    def fail_dispatch(_rid, _sid, current, _text):
+        with current["history_lock"]:
+            server._enqueue_prompt(current, "newer", "newer-transport")
+        raise RuntimeError("sync setup failed")
+
+    monkeypatch.setattr(server, "_run_prompt_submit", fail_dispatch)
+
+    assert server._drain_queued_prompt("queued", "sid", session) is True
+    assert session["running"] is False
+    assert session["queued_prompt"] == {
+        "text": "older\n\nnewer",
+        "transport": "newer-transport",
+    }
+
+
+def test_failed_compute_queued_dispatch_restores_claim(monkeypatch):
+    session = _session(
+        running=False,
+        queued_prompt={"text": "isolated", "transport": None},
+    )
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: True)
+    monkeypatch.setattr(
+        server,
+        "_submit_prompt_to_compute_host",
+        lambda *_args: {"error": {"message": "dispatch rejected"}},
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    assert server._drain_queued_prompt("queued", "sid", session) is True
+    assert session["running"] is False
+    assert session["queued_prompt"] == {"text": "isolated", "transport": None}
+
+
+def test_compute_error_emit_failure_restores_claim_exactly_once(monkeypatch):
+    session = _session(
+        running=False,
+        queued_prompt={"text": "older", "transport": None},
+    )
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: True)
+    monkeypatch.setattr(
+        server,
+        "_submit_prompt_to_compute_host",
+        lambda *_args: {"error": {"message": "dispatch rejected"}},
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("transport closed")),
+    )
+
+    assert server._drain_queued_prompt("queued", "sid", session) is True
+    assert session["running"] is False
+    assert session["queued_prompt"] == {"text": "older", "transport": None}
+
+
+def test_cleanup_log_failure_restores_claim_exactly_once(monkeypatch):
+    session = _session(
+        running=False,
+        queued_prompt={"text": "older", "transport": None},
+    )
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("sync setup failed")),
+    )
+    monkeypatch.setattr(
+        server,
+        "_log_finished_session_steer",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("log unavailable")),
+    )
+
+    assert server._drain_queued_prompt("queued", "sid", session) is True
+    assert session["running"] is False
+    assert session["queued_prompt"] == {"text": "older", "transport": None}
+
+
+@pytest.mark.parametrize("compute_host", [False, True])
+def test_failed_claim_restoration_blocks_newer_idle_admission(monkeypatch, compute_host):
+    attempts = []
+    worker_response = {}
+    admission_started = threading.Event()
+    worker = None
+    session = _session(
+        running=False,
+        queued_prompt={"text": "older", "transport": None},
+    )
+    server._sessions["sid"] = session
+
+    if compute_host:
+        monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: True)
+
+        def submit_compute(_rid, _sid, _session, text):
+            attempts.append(text)
+            if len(attempts) == 1:
+                return {"error": {"message": "sync rejection"}}
+            return {"result": {}}
+
+        monkeypatch.setattr(server, "_submit_prompt_to_compute_host", submit_compute)
+        monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    else:
+
+        def submit_local(_rid, _sid, _session, text):
+            attempts.append(text)
+            if len(attempts) == 1:
+                raise RuntimeError("sync setup failed")
+
+        monkeypatch.setattr(server, "_run_prompt_submit", submit_local)
+
+    original_restore = server._restore_claimed_prompt_locked
+
+    def restore_with_barrier(current, failed):
+        nonlocal worker
+
+        def submit_newer():
+            admission_started.set()
+            worker_response["value"] = server.handle_request(
+                {
+                    "id": "newer",
+                    "method": "prompt.submit",
+                    "params": {"session_id": "sid", "text": "newer"},
+                }
+            )
+
+        worker = threading.Thread(target=submit_newer)
+        worker.start()
+        assert admission_started.wait(timeout=1)
+        worker.join(timeout=0.05)
+        assert worker.is_alive()
+        original_restore(current, failed)
+
+    monkeypatch.setattr(server, "_restore_claimed_prompt_locked", restore_with_barrier)
+    try:
+        assert server._drain_queued_prompt("queued", "sid", session) is True
+        assert worker is not None
+        worker.join(timeout=1)
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert not worker.is_alive()
+    assert worker_response["value"]["result"]["status"] == "streaming"
+    assert attempts == ["older", "older\n\nnewer"]
+    assert session["queued_prompt"] is None
+    assert session["running"] is True
+
+
+def test_idle_submit_drains_restored_queue_before_new_input(monkeypatch):
+    dispatched = []
+    session = _session(
+        running=False,
+        queued_prompt={"text": "restored", "transport": None},
+    )
+    server._sessions["sid"] = session
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, _session, text: dispatched.append(text),
+    )
+    try:
+        response = server.handle_request(
+            {
+                "id": "new",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "newer"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response is not None
+    assert response["result"]["status"] == "streaming"
+    assert dispatched == ["restored\n\nnewer"]
+    assert session["queued_prompt"] is None
+
+
 def test_cancelled_busy_steer_mode_queues_for_replacement(monkeypatch):
     steer_calls = []
 
@@ -7131,6 +7565,46 @@ def test_cancelled_busy_steer_mode_queues_for_replacement(monkeypatch):
     assert response is not None
     assert response["result"]["status"] == "queued"
     assert steer_calls == []
+    assert session["queued_prompt"]["text"] == "replacement guidance"
+
+
+def test_isolated_busy_steer_mode_never_targets_dormant_local_agent(monkeypatch):
+    steer_calls = []
+    interrupt_calls = []
+
+    class _Agent:
+        def steer(self, text):
+            steer_calls.append(text)
+            return True
+
+    class _Supervisor:
+        def interrupt(self, sid):
+            interrupt_calls.append(sid)
+
+    session = _session(
+        agent=_Agent(),
+        running=True,
+        _compute_host_active=True,
+    )
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: _Supervisor())
+    try:
+        response = server.handle_request(
+            {
+                "id": "isolated-busy",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "replacement guidance"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response is not None
+    assert response["result"]["status"] == "queued"
+    assert steer_calls == []
+    assert interrupt_calls == ["sid"]
     assert session["queued_prompt"]["text"] == "replacement guidance"
 
 
@@ -9905,13 +10379,35 @@ def test_notification_claim_precedes_running_publication(monkeypatch):
 
     token = object()
     monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: token)
-    session = _session(running=False)
+    session = _session(
+        running=False,
+        _turn_cancel_requested=True,
+        _compute_host_active=True,
+    )
 
     claim, busy = server._claim_notification_turn(session, {"type": "completion"}, "test")
 
     assert claim is token
     assert busy is False
     assert session["running"] is True
+    assert session["_turn_cancel_requested"] is False
+    assert session["_compute_host_active"] is False
+
+
+def test_inline_successor_publication_resets_prior_generation_state():
+    session = _session(
+        running=False,
+        _turn_cancel_requested=True,
+        _compute_host_active=True,
+    )
+
+    with session["history_lock"]:
+        started = server._start_inline_successor_turn_locked(session)
+
+    assert started is True
+    assert session["running"] is True
+    assert session["_turn_cancel_requested"] is False
+    assert session["_compute_host_active"] is False
 
 
 def test_notification_retry_requeues_even_when_release_raises(monkeypatch):
