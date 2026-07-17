@@ -2866,15 +2866,37 @@ class AIAgent:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
             # Fall back to direct attribute set; no concurrent callers expected
             # in those stubs.
+            if not getattr(self, "_steer_accepting", False):
+                return False
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
             return True
         with _lock:
+            if not getattr(self, "_steer_accepting", False):
+                return False
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
         return True
+
+    def _open_steer_window(self) -> None:
+        """Allow guidance while a tool batch has a future drain point."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            self._steer_accepting = True
+            return
+        with _lock:
+            self._steer_accepting = True
+
+    def _close_steer_window(self) -> None:
+        """Reject new guidance before a tool batch's final steer drain."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            self._steer_accepting = False
+            return
+        with _lock:
+            self._steer_accepting = False
 
     def _drain_pending_steer(self) -> Optional[str]:
         """Return the pending steer text (if any) and clear the slot.
@@ -6019,6 +6041,7 @@ class AIAgent:
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
+        self._open_steer_window()
         try:
             if len(tool_calls) <= 1:
                 return self._execute_tool_calls_sequential(
@@ -6046,6 +6069,7 @@ class AIAgent:
                 segments=segments,
             )
         finally:
+            self._close_steer_window()
             self._executing_tools = False
 
     def _dispatch_delegate_task(self, function_args: dict) -> str:

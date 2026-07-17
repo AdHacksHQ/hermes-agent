@@ -23,6 +23,7 @@ def _bare_agent() -> AIAgent:
     agent = object.__new__(AIAgent)
     agent._pending_steer = None
     agent._pending_steer_lock = threading.Lock()
+    agent._steer_accepting = True
     return agent
 
 
@@ -59,6 +60,13 @@ class TestSteerAcceptance:
         agent.steer("third note")
         assert agent._pending_steer == "first note\nsecond note\nthird note"
 
+    def test_rejects_after_consumption_window_closes(self):
+        agent = _bare_agent()
+        agent._close_steer_window()
+
+        assert agent.steer("too late") is False
+        assert agent._pending_steer is None
+
 
 class TestSteerDrain:
     def test_drain_returns_and_clears(self):
@@ -70,6 +78,15 @@ class TestSteerDrain:
     def test_drain_on_empty_returns_none(self):
         agent = _bare_agent()
         assert agent._drain_pending_steer() is None
+
+    def test_close_boundary_rejects_late_steer_and_preserves_accepted_text(self):
+        agent = _bare_agent()
+        assert agent.steer("accepted during tool execution") is True
+
+        agent._close_steer_window()
+
+        assert agent.steer("too late for this tool batch") is False
+        assert agent._drain_pending_steer() == "accepted during tool execution"
 
 
 class TestSteerInjection:
