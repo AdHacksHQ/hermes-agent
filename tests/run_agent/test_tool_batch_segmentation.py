@@ -388,11 +388,15 @@ class TestSegmentedDispatchIntegration:
         ]
         msg = SimpleNamespace(content="", tool_calls=calls)
         messages = []
+        steer_sent = False
 
         def fake_handle(name, args, task_id, **kwargs):
+            nonlocal steer_sent
+            if not steer_sent:
+                assert agent.steer("focus on the tests") is True
+                steer_sent = True
             return json.dumps({"ok": True})
 
-        agent.steer("focus on the tests")
         with patch("run_agent.handle_function_call", side_effect=fake_handle):
             agent._execute_tool_calls(msg, messages, "task-1")
 

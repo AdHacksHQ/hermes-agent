@@ -1021,6 +1021,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # agent sees it on its next iteration. Runs AFTER budget enforcement
     # so the steer marker is never truncated. See steer() for details.
     if finalize and num_tools > 0:
+        agent._close_steer_window()
         agent._apply_pending_steer_to_tool_results(messages, num_tools)
 
 
@@ -1734,6 +1735,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # See _execute_tool_calls_parallel for the rationale. Same hook,
     # applied to sequential execution as well.
     if finalize and num_tools_seq > 0:
+        agent._close_steer_window()
         agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
 
 
@@ -1791,6 +1793,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             env=get_active_env(effective_task_id),
             config=_tool_budget,
         )
+        agent._close_steer_window()
         agent._apply_pending_steer_to_tool_results(messages, total_tools)
 
 
