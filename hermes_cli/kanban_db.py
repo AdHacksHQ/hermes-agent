@@ -7293,13 +7293,22 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
         return None
 
     now = int(time.time())
+
+    # LOCAL PATCH (AdHacks, 2026-07-07): the verifier profile's entire job is
+    # a task that HAS a merged PR and a fresh successful coder run — the
+    # "recent_success" (1h) and "active_pr" (24h) guards below therefore
+    # starved the review lane (4 ready+verifier cards sat 11-14h undispatched;
+    # dispatcher parked them in respawn_guarded every tick, which the text
+    # summary doesn't even print). Rate-limit / auth-blocker guards (1-2)
+    # still apply to verifier tasks.
+    _pr_guard_exempt = (row["assignee"] or "") == "verifier"
 
     # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
     #    (quota wall) — defer while inside the cooldown window, then allow a
@@ -7348,8 +7357,9 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    reclaim) is a deliberate "run it again" — honor it instead of
     #    deferring. Without this, a manual done→ready just sits there,
     #    silently held by the guard, until the window elapses.
+    #    (Skipped for verifier-lane tasks — see LOCAL PATCH above.)
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
-    recent_completed = conn.execute(
+    recent_completed = None if _pr_guard_exempt else conn.execute(
         "SELECT ended_at FROM task_runs "
         "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ? "
         "ORDER BY ended_at DESC LIMIT 1",
@@ -7368,11 +7378,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    (Skipped for verifier-lane tasks — the PR link is their work item.)
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
+    for c in (() if _pr_guard_exempt else conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
-    ).fetchall():
+    ).fetchall()):
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
             return "active_pr"
 
